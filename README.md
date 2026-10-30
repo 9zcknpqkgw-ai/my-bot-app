@@ -1,1 +1,4 @@
-# my-bot-app
+streamlit
+ccxt
+pandas
+pandas_ta
