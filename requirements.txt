@@ -1,5 +1,0 @@
-streamlit
-ccxt
-pandas
-ta
-numpy<2
