@@ -1,0 +1,184 @@
+import streamlit as st
+import pandas as pd
+import requests
+import time
+from ta.momentum import RSIIndicator
+from ta.trend import ADXIndicator
+from ta.volatility import AverageTrueRange
+
+# --- НАСТРОЙКА И ДИЗАЙН (ВОЗВРАЩАЕМ КРАСОТУ) ---
+st.set_page_config(page_title="OKX Bot Manager", page_icon="📈", layout="wide")
+
+st.markdown("""
+<style>
+.stApp { background-color: #050505; color: #ffffff; }
+[data-testid="stSidebar"] { background-color: #0b0b0b; border-right: 1px solid #252525; }
+h1, h2, h3, p, label, span { color: #ffffff; }
+.metric-card {
+    background-color: #111111; border: 1px solid #333333; border-radius: 14px;
+    padding: 18px 20px; min-height: 120px;
+}
+.metric-label { color: #a9a9a9; font-size: 0.9rem; }
+.metric-value { color: #ffffff; font-size: 1.65rem; font-weight: 700; margin-top: 8px; }
+.stButton > button {
+    background: linear-gradient(135deg, #00ff87, #60efff);
+    color: #000000; border: 0; border-radius: 10px; font-weight: 700;
+}
+.stButton > button:hover { background: #00cc6a; color: #000000; }
+div[data-testid="stDataFrame"] { border: 1px solid #333333; border-radius: 10px; }
+</style>
+""", unsafe_allow_html=True)
+
+# --- ПАМЯТЬ ---
+if "last_signals" not in st.session_state: st.session_state.last_signals = {}
+
+COINS = ["BTC", "ETH", "SOL", "BNB", "XRP", "DOGE", "ADA", "AVAX", "LINK", "DOT"]
+OKX_URL = "https://www.okx.com/api/v5/market/candles"
+HEADERS = {"User-Agent": "Mozilla/5.0"}
+
+def metric_card(label, value):
+    st.markdown(f'<div class="metric-card"><div class="metric-label">{label}</div><div class="metric-value">{value}</div></div>', unsafe_allow_html=True)
+
+# --- TELEGRAM ИЗ SECRETS ---
+def get_tg_data():
+    try: return st.secrets["telegram"]["token"], st.secrets["telegram"]["chat_id"]
+    except: return "", ""
+
+def send_tg(msg):
+    token, chat = get_tg_data()
+    if token and chat:
+        try:
+            requests.post(f"https://api.telegram.org/bot{token}/sendMessage", json={"chat_id": chat, "text": msg})
+            return True
+        except: return False
+    return False
+
+# --- ЛОГИКА СКАНЕРА ---
+def fetch_market_data(symbol):
+    params = {"instId": symbol, "bar": "1D", "limit": "30"}
+    response = requests.get(OKX_URL, params=params, headers=HEADERS, timeout=15)
+    payload = response.json()
+    if payload.get("code") != "0" or not payload.get("data"): raise ValueError("OKX error")
+    raw = list(reversed(payload["data"]))
+    df = pd.DataFrame(raw, columns=["timestamp", "open", "high", "low", "close", "volume", "volume_ccy", "volume_quote", "confirm"])
+    for col in ["open", "high", "low", "close", "volume"]: df[col] = pd.to_numeric(df[col], errors="coerce")
+    return df.dropna(subset=["high", "low", "close"]).reset_index(drop=True)
+
+def analyze(coin, symbol):
+    df = fetch_market_data(symbol)
+    close, high, low = df["close"], df["high"], df["low"]
+    rsi = float(RSIIndicator(close=close, window=14).rsi().iloc[-1])
+    adx = float(ADXIndicator(high=high, low=low, close=close, window=14).adx().iloc[-1])
+    atr = float(AverageTrueRange(high=high, low=low, close=close, window=14).average_true_range().iloc[-1])
+    price = float(close.iloc[-1])
+    atr_pct = (atr / price * 100) if price else 0.0
+    
+    if adx > 25:
+        if rsi < 40: signal, phase, bot = "🟢 ЛОНГ", "Тренд", "DCA Long"
+        elif rsi > 50: signal, phase, bot = "⏳ ЖДАТЬ", "Тренд", "Пауза"
+        else: signal, phase, bot = "🔴 ШОРТ", "Тренд", "DCA Short"
+    else: signal, phase, bot = "🟡 СЕТКА", "Флэт", "Grid"
+    
+    if coin in ("BTC", "ETH"): classification = "Консерв."
+    elif atr_pct > 3: classification = "Агрессив."
+    else: classification = "Умерен."
+    
+    return {"Монета": coin, "Цена": price, "Фаза": phase, "Класс": classification, "RSI": rsi, "ADX": adx, "Сигнал": signal, "Бот": bot}
+
+def signal_style(value):
+    if "ЛОНГ" in str(value): return "color: #00ff87; font-weight: bold"
+    if "ШОРТ" in str(value): return "color: #ff4d4f; font-weight: bold"
+    if "СЕТКА" in str(value): return "color: #ffd700; font-weight: bold"
+    return "color: #bbbbbb"
+
+# --- МЕНЮ ---
+with st.sidebar:
+    st.title("📈 OKX Manager")
+    page = st.radio("Раздел", ["Главная", "Сканер рынка", "План DCA", "План Grid", "Позиция", "Настройки"])
+
+st.title(page)
+
+# --- 1. ГЛАВНАЯ ---
+if page == "Главная":
+    st.subheader("Добрый день, брат! 👋")
+    cols = st.columns(4)
+    values = [("Статус", "Онлайн"), ("Баланс", "0 USDT"), ("Боты", "0"), ("Риск", "Низкий")]
+    for col, (label, value) in zip(cols, values):
+        with col: metric_card(label, value)
+
+# --- 2. СКАНЕР (С ВЫБОРОМ РЫНКА) ---
+elif page == "Сканер рынка":
+    market = st.radio("Выберите рынок:", ["Фьючерсы (SWAP)", "Спот"], horizontal=True)
+    
+    if st.button("🚀 Сканировать ТОП-10", use_container_width=True):
+        res = []
+        bar = st.progress(0)
+        for i, coin in enumerate(COINS):
+            sym = f"{coin}-USDT-SWAP" if market == "Фьючерсы (SWAP)" else f"{coin}-USDT"
+            try:
+                data = analyze(coin, sym)
+                if data: res.append(data)
+            except: pass
+            bar.progress((i+1)/len(COINS))
+        
+        if res:
+            df = pd.DataFrame(res)
+            styled = df.style.format({"Цена": "{:.6f}", "RSI": "{:.2f}", "ADX": "{:.2f}"}).map(signal_style, subset=["Сигнал"])
+            st.dataframe(styled, use_container_width=True, hide_index=True)
+            
+            # Отправка в ТГ
+            if get_tg_data()[0]:
+                msg = "📊 **Сигналы:**\n\n"
+                has_new = False
+                for row in res:
+                    if "ЛОНГ" in row["Сигнал"] or "ШОРТ" in row["Сигнал"]:
+                        msg += f"{row['Монета']}: {row['Сигнал']}\n"
+                        has_new = True
+                if has_new: send_tg(msg); st.success("✉️ Отправлено в ТГ!")
+        else:
+            st.error("Ошибка загрузки.")
+
+# --- 3. DCA ---
+elif page == "План DCA":
+    entry = st.number_input("Цена входа", value=100.0)
+    count = st.number_input("Кол-во СО", value=5)
+    step = st.number_input("Шаг %", value=2.0)
+    if st.button("Рассчитать", use_container_width=True):
+        rows, total = [], 0
+        for i in range(int(count)):
+            p = entry * (1 - step/100 * i)
+            a = 10.0 * (1.2 ** i)
+            total += a
+            rows.append({"Шаг": i+1, "Цена": p, "Сумма": a})
+        st.dataframe(pd.DataFrame(rows), use_container_width=True)
+        st.success(f"Всего: {total:.2f} USDT")
+
+# --- 4. GRID ---
+elif page == "План Grid":
+    low = st.number_input("Нижняя", value=90.0)
+    high = st.number_input("Верхняя", value=110.0)
+    grids = st.number_input("Сеток", value=10)
+    if st.button("Рассчитать", use_container_width=True):
+        w = (high - low) / low * 100
+        s = (high - low) / (grids - 1) / low * 100
+        st.metric("Ширина", f"{w:.2f}%")
+        st.metric("Шаг", f"{s:.2f}%")
+
+# --- 5. ПОЗИЦИЯ ---
+elif page == "Позиция":
+    cur = st.number_input("Текущая цена", value=100.0)
+    avg = st.number_input("Средняя цена", value=100.0)
+    size = st.number_input("Размер", value=100.0)
+    if st.button("Разобрать", use_container_width=True):
+        pnl = (cur - avg) / avg * size
+        st.metric("PnL", f"{pnl:.2f} USDT")
+        if send_tg(f"🔔 PnL: {pnl:.2f} USDT"): st.info("Уведомление в ТГ.")
+
+# --- 6. НАСТРОЙКИ ---
+elif page == "Настройки":
+    st.subheader("Настройки")
+    st.info("Telegram настраивается через Secrets на сайте Streamlit Cloud.")
+    st.markdown("Для проверки нажмите кнопку ниже:")
+    if st.button("Тест Telegram", use_container_width=True):
+        if send_tg("Привет, брат! Это тест."): st.success("✅ Отправлено!")
+        else: st.error("❌ Ошибка. Проверьте Secrets.")
